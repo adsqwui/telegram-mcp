@@ -508,6 +508,83 @@ async def tg_click(chat: str, message_id: int, row: int, col: int, wait: float =
     return (note or "Pressed.") + _replies(changed, max(wait, 1.0))
 
 
+async def _invite(client, entity, members: list[str]) -> list[str]:
+    """Add users to a group or channel; returns one line per user."""
+    report = []
+    for ref in members:
+        try:
+            user = await resolve(ref)
+            if not isinstance(user, types.User):
+                report.append(f"  {ref}: not a user, skipped")
+                continue
+            if user.is_self:
+                report.append(f"  {ref}: this is your own account, it is already in the chat")
+                continue
+            await _throttle()
+            if isinstance(entity, types.Chat):
+                result = await client(functions.messages.AddChatUserRequest(entity.id, user, fwd_limit=100))
+            else:
+                result = await client(functions.channels.InviteToChannelRequest(entity, [user]))
+            if getattr(result, "missing_invitees", None):
+                report.append(f"  {ref}: privacy settings do not allow adding, send them the invite link")
+            else:
+                report.append(f"  {ref}: added")
+        except (errors.RPCError, ValueError) as e:
+            report.append(f"  {ref}: not added ({type(e).__name__}: {e})")
+    return report
+
+
+async def _create(title: str, about: str, megagroup: bool, members: list[str] | None, username: str | None) -> str:
+    client = await get_client()
+    await _throttle()
+    result = await client(
+        functions.channels.CreateChannelRequest(title=title, about=about, megagroup=megagroup, broadcast=not megagroup)
+    )
+    entity = result.chats[0]
+    lines = [f"Created {describe_chat(entity)}."]
+    if username:
+        try:
+            await client(functions.channels.UpdateUsernameRequest(entity, username.lstrip("@")))
+            lines.append(f"public link: https://t.me/{username.lstrip('@')}")
+        except errors.RPCError as e:
+            lines.append(f"Could not set the public username: {type(e).__name__}: {e}")
+    # The chat's primary link, the same one tg_chat_info shows; create a new one only if there is none
+    invite = (await client(functions.channels.GetFullChannelRequest(entity))).full_chat.exported_invite
+    if invite is None:
+        invite = await client(functions.messages.ExportChatInviteRequest(entity))
+    lines.append(f"invite link: {invite.link}")
+    if members:
+        lines += ["members:", *await _invite(client, entity, members)]
+    await dialogs(force=True)
+    return "\n".join(lines)
+
+
+@tool("Create group", write=True)
+async def tg_create_group(title: str, members: list[str] | None = None, about: str = "") -> str:
+    """Create a group (supergroup) owned by this account. members: ids or @usernames to add right away.
+    Returns the new chat id and an invite link."""
+    return await _create(title, about, megagroup=True, members=members, username=None)
+
+
+@tool("Create channel", write=True)
+async def tg_create_channel(
+    title: str, about: str = "", username: str | None = None, members: list[str] | None = None
+) -> str:
+    """Create a channel owned by this account. username makes it public (t.me/username), otherwise it is
+    private. members: ids or @usernames to add as subscribers. Returns the new chat id and an invite link."""
+    return await _create(title, about, megagroup=False, members=members, username=username)
+
+
+@tool("Add members", write=True)
+async def tg_add_members(chat: str, members: list[str]) -> str:
+    """Add people to a group or channel where this account may invite. members: ids or @usernames."""
+    client = await get_client()
+    entity = await resolve(chat)
+    if kind_of(entity) not in {"group", "channel"}:
+        raise ValueError(f"{describe_chat(entity)} is not a group or channel.")
+    return "\n".join([f"Adding to {describe_chat(entity)}:", *await _invite(client, entity, members)])
+
+
 # ---------------------------------------------------------------- transports
 
 
