@@ -1,0 +1,369 @@
+"""MCP server: a Telegram user account for an AI agent (Telethon, MTProto)."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import binascii
+import functools
+import hmac
+import time
+from pathlib import Path
+from typing import Literal
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
+from telethon import errors, functions, types, utils
+
+from . import __version__, config, media
+from .client import describe_chat, dialogs, get_client, is_hidden, kind_of, resolve
+from .render import (
+    button_rows,
+    day_range,
+    downloadable,
+    local,
+    media_kind,
+    media_label,
+    parse_day,
+    parse_moment,
+    render,
+    safe_filename,
+)
+
+MAX_READ = 500
+MAX_INLINE_IMAGES = 10
+MAX_MEDIA_PER_CALL = 10
+POLL_INTERVAL = 0.7  # how often the chat is re-read while waiting for a reply
+SETTLE_SECONDS = 1.5  # the reply counts as finished after this long without changes
+WATCH_LAST = 30
+MAX_WAIT = 60.0
+
+mcp = MCPServer(
+    "telegram",
+    version=__version__,
+    instructions=(
+        "A Telegram user account. `chat` accepts a numeric id from tg_list_chats (most reliable), "
+        "@username, a t.me link, 'me' for Saved Messages, or the exact chat title. "
+        "Read with tg_read_messages (date='today' or a date for one day, before_id to page back through "
+        "the whole history). Voice messages come transcribed; tg_get_media returns images, transcripts and "
+        "file contents. Messages you send go out from the user's real account: send only what the task asks for. "
+        "Never press buttons that pay, confirm an order or top up a balance."
+    ),
+)
+
+_last_write = 0.0
+
+
+def tool(title: str, write: bool = False):
+    """Register a tool that returns plain text/content. Expected failures reach the model as a
+    readable isError result instead of a generic crash message."""
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            if write and config.get().read_only:
+                raise ToolError("Refused: the server runs with TG_READ_ONLY=true, writing is disabled.")
+            try:
+                return await fn(*args, **kwargs)
+            except errors.FloodWaitError as e:
+                raise ToolError(f"Telegram FloodWait: wait {e.seconds} s before the next request of this kind.")
+            except (errors.RPCError, ValueError, RuntimeError, OSError) as e:
+                raise ToolError(f"{type(e).__name__}: {e}") from e
+
+        annotations = ToolAnnotations(title=title, read_only_hint=not write, destructive_hint=False, open_world_hint=True)
+        return mcp.tool(annotations=annotations, structured_output=False)(wrapper)
+
+    return decorate
+
+
+async def _throttle() -> None:
+    global _last_write
+    delay = _last_write + config.get().min_action_gap - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _last_write = time.monotonic()
+
+
+def _fingerprint(msg) -> tuple:
+    return (msg.message, msg.edit_date, str(msg.reply_markup), getattr(msg.media, "photo", None) and msg.photo.id)
+
+
+async def _act_and_wait(client, entity, action, wait: float):
+    """Run a write action. With wait > 0, also collect incoming messages that appeared or changed
+    until the chat is quiet for SETTLE_SECONDS (handy for bots)."""
+    before = {}
+    if wait > 0:
+        before = {m.id: _fingerprint(m) for m in await client.get_messages(entity, limit=WATCH_LAST)}
+    await _throttle()
+    result = await action()
+    if wait <= 0:
+        return result, []
+
+    deadline = time.monotonic() + min(wait, MAX_WAIT)
+    seen: dict = {}
+    latest: dict = {}
+    last_change = None
+    while time.monotonic() < deadline:
+        await asyncio.sleep(POLL_INTERVAL)
+        msgs = await client.get_messages(entity, limit=WATCH_LAST)
+        changed = {m.id: m for m in msgs if not m.out and before.get(m.id) != _fingerprint(m)}
+        current = {i: _fingerprint(m) for i, m in changed.items()}
+        if current != seen:
+            seen, latest, last_change = current, changed, time.monotonic()
+        elif last_change and time.monotonic() - last_change >= SETTLE_SECONDS:
+            break
+    return result, sorted(latest.values(), key=lambda m: m.id)
+
+
+def _replies(changed: list, wait: float) -> str:
+    if wait <= 0:
+        return ""
+    if not changed:
+        return f"\nNo new or edited incoming messages within {wait:g} s."
+    tz = config.get().tz
+    return f"\n{len(changed)} new or edited incoming message(s):\n\n" + "\n\n".join(render(m, tz) for m in changed)
+
+
+# ---------------------------------------------------------------- reading
+
+
+@tool("Account status")
+async def tg_status() -> str:
+    """Which account the server uses and how it is configured. Call it first if anything fails."""
+    s = config.get()
+    client = await get_client()
+    me = await client.get_me()
+    name = utils.get_display_name(me)
+    lines = [
+        f"account: {name}" + (f" @{me.username}" if me.username else "") + f" (id {me.id})",
+        f"read only: {s.read_only}",
+        f"timezone: {s.tz.key}",
+        f"transcription: {'on, whisper ' + s.whisper_model if s.transcribe else 'off'}",
+        f"files are saved to: {s.files_dir}",
+        "tg_send_file accepts local files from: " + ", ".join(str(p) for p in s.allowed_roots),
+    ]
+    return "\n".join(lines)
+
+
+@tool("List chats")
+async def tg_list_chats(
+    kind: Literal["all", "private", "group", "channel", "bot"] = "all",
+    unread_only: bool = False,
+    query: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List dialogs in Telegram's order (pinned first, then newest activity): id, title, type, unread count,
+    last message.
+
+    kind filters by type ("private" includes Saved Messages). query matches the title or @username.
+    """
+    s = config.get()
+    needle = (query or "").strip().lstrip("@").casefold()
+    rows, total = [], 0
+    for d in await dialogs(force=True):
+        if is_hidden(d.entity):
+            continue
+        k = kind_of(d.entity)
+        if kind != "all" and k != kind and not (kind == "private" and k == "saved"):
+            continue
+        if unread_only and not d.unread_count:
+            continue
+        username = (getattr(d.entity, "username", None) or "").casefold()
+        if needle and needle not in (d.name or "").casefold() and needle != username:
+            continue
+        total += 1
+        if len(rows) >= max(1, min(limit, 500)):
+            continue
+        line = describe_chat(d.entity)
+        if d.unread_count:
+            line += f" · unread {d.unread_count}"
+        if d.unread_mentions_count:
+            line += f" (mentions {d.unread_mentions_count})"
+        if d.pinned:
+            line += " · pinned"
+        if d.archived:
+            line += " · archived"
+        m = d.message
+        if m:
+            preview = (m.message or "").replace("\n", " ")[:90] or f"[{media_label(m) or 'service'}]"
+            line += f"\n    {local(m.date, s.tz)} {'me' if m.out else ''}: {preview}".replace(" :", ":")
+        rows.append(line)
+    if not rows:
+        return "No chats match."
+    tail = f"\n\nShowing {len(rows)} of {total}. Raise limit or narrow with query." if total > len(rows) else ""
+    return "\n".join(rows) + tail
+
+
+@tool("Chat info")
+async def tg_chat_info(chat: str) -> str:
+    """Details of a chat, group, channel, user or bot: description, members, your rights, invite link, bot commands."""
+    client = await get_client()
+    entity = await resolve(chat)
+    lines = [describe_chat(entity)]
+    if isinstance(entity, types.User):
+        full = (await client(functions.users.GetFullUserRequest(entity))).full_user
+        if entity.phone:
+            lines.append(f"phone: +{entity.phone}")
+        if full.about:
+            lines.append(f"about: {full.about}")
+        info = full.bot_info
+        if info and info.description:
+            lines.append(f"bot description: {info.description}")
+        if info and info.commands:
+            lines.append("bot commands: " + ", ".join(f"/{c.command} ({c.description})" for c in info.commands))
+    elif isinstance(entity, types.Channel):
+        full = (await client(functions.channels.GetFullChannelRequest(entity))).full_chat
+        lines.append(f"members: {full.participants_count}")
+        if full.about:
+            lines.append(f"about: {full.about}")
+        role = "owner" if entity.creator else "admin" if entity.admin_rights else "member"
+        lines.append(f"your role: {role}")
+        if full.exported_invite:
+            lines.append(f"invite link: {full.exported_invite.link}")
+        if entity.username:
+            lines.append(f"public link: https://t.me/{entity.username}")
+    elif isinstance(entity, types.Chat):
+        full = (await client(functions.messages.GetFullChatRequest(entity.id))).full_chat
+        lines.append(f"members: {entity.participants_count}")
+        if full.about:
+            lines.append(f"about: {full.about}")
+        if full.exported_invite:
+            lines.append(f"invite link: {full.exported_invite.link}")
+    return "\n".join(lines)
+
+
+@tool("Read messages")
+async def tg_read_messages(
+    chat: str,
+    date: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+    before_id: int | None = None,
+    after_id: int | None = None,
+    search: str | None = None,
+    from_user: str | None = None,
+    transcribe_voice: bool = True,
+    include_images: bool = False,
+    mark_read: bool = False,
+) -> list:
+    """Read messages of any chat, group or channel, oldest first.
+
+    date: one day, "today", "yesterday", "2026-11-24" or "24.11.2026" (in TG_TIMEZONE).
+    since / until: a range instead of date, a day or "2026-11-24 14:00".
+    limit: up to 500 per call. To read the whole history, repeat the call with before_id set to the
+    smallest id from the previous page until no more pages are reported. after_id returns only newer messages.
+    search: only messages containing this text. from_user: only messages from this person.
+    transcribe_voice: voice and round video messages come with a text transcript.
+    include_images: photos are attached as images (at most 10 per call).
+    mark_read: mark the chat as read up to the newest returned message.
+    """
+    s = config.get()
+    client = await get_client()
+    entity = await resolve(chat)
+    lo = hi = None
+    if date:
+        lo, hi = day_range(parse_day(date, s.tz), s.tz)
+    if since:
+        lo = parse_moment(since, s.tz)
+    if until:
+        hi = parse_moment(until, s.tz, end_of_day=True)
+    limit = max(1, min(limit, MAX_READ))
+    sender = await resolve(from_user) if from_user else None
+
+    msgs, more = [], False
+    async for m in client.iter_messages(
+        entity, offset_date=hi, offset_id=before_id or 0, min_id=after_id or 0, search=search or None, from_user=sender
+    ):
+        if lo and m.date < lo:
+            break
+        if len(msgs) == limit:
+            more = True
+            break
+        msgs.append(m)
+    msgs.reverse()
+
+    transcripts, notes = {}, []
+    if transcribe_voice and s.transcribe:
+        for m in msgs:
+            if media_kind(m) not in {"voice", "video_note"}:
+                continue
+            if (m.file.duration or 0) > s.transcribe_max_seconds:
+                notes.append(f"#{m.id} is longer than {s.transcribe_max_seconds} s, get it with tg_get_media.")
+                continue
+            try:
+                transcripts[m.id] = await media.voice_transcript(client, m)
+            except RuntimeError as e:
+                notes.append(str(e))
+                break
+
+    images = []
+    if include_images:
+        for m in msgs:
+            if media_kind(m) == "photo" and len(images) < MAX_INLINE_IMAGES:
+                images.append((m.id, await client.download_media(m, file=bytes)))
+
+    if lo or hi:
+        span = f" from {local(lo, s.tz) if lo else 'the start'} to {local(hi, s.tz) if hi else 'now'}"
+    else:
+        span = ""
+    head = f"{describe_chat(entity)} · {len(msgs)} message(s){span}"
+    if not msgs:
+        return [media.text(head + "\nNo messages found.")]
+    parts = [head, *(render(m, s.tz, transcripts.get(m.id)) for m in msgs)]
+    if more:
+        parts.append(f"More messages exist. Next (older) page: the same call with before_id={msgs[0].id}.")
+    with_media = [m.id for m in msgs if media_kind(m) and m.id not in transcripts and m.id not in dict(images)]
+    if with_media:
+        ids = ", ".join(map(str, with_media[:30]))
+        parts.append(f"Messages with media: {ids}. tg_get_media returns images, transcripts and file contents.")
+    parts += notes
+    if mark_read:
+        await client.send_read_acknowledge(entity, max_id=msgs[-1].id)
+        parts.append("Marked as read.")
+
+    out = [media.text("\n\n".join(parts))]
+    for msg_id, data in images:
+        out += [media.text(f"photo from #{msg_id}:"), media.image(data, "image/jpeg")]
+    return out
+
+
+@tool("Get media")
+async def tg_get_media(chat: str, message_ids: list[int], transcribe: bool = True, embed_file: bool = False) -> list:
+    """Download the media of up to 10 messages and return it in a usable form.
+
+    Photos and images come back as images, video as a thumbnail plus transcript, voice/audio as a
+    transcript, text and PDF files as their text. Every file is saved on the server and its path is
+    returned (it can be sent again with tg_send_file). embed_file also attaches the raw file bytes.
+    """
+    client = await get_client()
+    entity = await resolve(chat)
+    ids = list(dict.fromkeys(message_ids))[:MAX_MEDIA_PER_CALL]
+    out, missing = [], []
+    for msg_id, msg in zip(ids, await client.get_messages(entity, ids=ids)):
+        if msg is None:
+            missing.append(msg_id)
+        elif not downloadable(msg):
+            out.append(media.text(f"#{msg.id} has no file ({media_label(msg) or 'text only'})."))
+        else:
+            out += await media.full_content(client, msg, transcribe_audio=transcribe, embed_file=embed_file)
+    if missing:
+        out.append(media.text(f"Not found in this chat: {', '.join(map(str, sorted(missing)))}"))
+    return out or [media.text("Nothing to return.")]
+
+
+# ---------------------------------------------------------------- transports
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Telegram MCP server")
+    parser.add_argument("--env-file", help="path to .env (default: the project's .env)")
+    args = parser.parse_args()
+    config.load(args.env_file)
+    mcp.run("stdio")
+
+
+if __name__ == "__main__":
+    main()
