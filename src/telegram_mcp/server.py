@@ -588,12 +588,42 @@ async def tg_add_members(chat: str, members: list[str]) -> str:
 # ---------------------------------------------------------------- transports
 
 
+class BearerAuth:
+    """Rejects HTTP requests without the right "Authorization: Bearer <token>" header."""
+
+    def __init__(self, app, token: str | None):
+        self.app, self.expected = app, (f"Bearer {token}".encode() if token else None)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self.expected:
+            supplied = dict(scope["headers"]).get(b"authorization", b"")
+            if not hmac.compare_digest(supplied, self.expected):
+                from starlette.responses import JSONResponse
+
+                return await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Telegram MCP server")
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
     parser.add_argument("--env-file", help="path to .env (default: the project's .env)")
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
     args = parser.parse_args()
-    config.load(args.env_file)
-    mcp.run("stdio")
+    s = config.load(args.env_file)
+
+    if args.transport == "stdio":
+        mcp.run("stdio")
+        return
+
+    import uvicorn
+
+    host, port = args.host or s.host, args.port or s.port
+    if host not in config.LOOPBACK_HOSTS and not s.bearer_token:
+        raise SystemExit("MCP_BEARER_TOKEN must be set when the server listens on a non-loopback address.")
+    app = mcp.streamable_http_app(json_response=True, stateless_http=True, host=host)
+    uvicorn.run(BearerAuth(app, s.bearer_token), host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
