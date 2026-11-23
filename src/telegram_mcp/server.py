@@ -354,6 +354,160 @@ async def tg_get_media(chat: str, message_ids: list[int], transcribe: bool = Tru
     return out or [media.text("Nothing to return.")]
 
 
+# ---------------------------------------------------------------- writing
+
+_PARSE_MODES = {"markdown": "md", "html": "html", "plain": None}
+
+
+@tool("Send message", write=True)
+async def tg_send_message(
+    chat: str,
+    text: str,
+    reply_to: int | None = None,
+    format: Literal["markdown", "html", "plain"] = "markdown",
+    silent: bool = False,
+    wait_reply: float = 0,
+) -> str:
+    """Send a text message to a private chat, group, channel (you must be allowed to post) or bot.
+
+    format "markdown": **bold**, __italic__, `code`, [text](https://link). reply_to: message id to reply to.
+    silent: no notification sound. wait_reply: seconds to wait and return incoming replies (useful for bots).
+    """
+    client = await get_client()
+    entity = await resolve(chat)
+
+    def action():
+        return client.send_message(entity, text, parse_mode=_PARSE_MODES[format], reply_to=reply_to, silent=silent)
+
+    sent, changed = await _act_and_wait(client, entity, action, wait_reply)
+    return f"Sent #{sent.id} to {describe_chat(entity)}." + _replies(changed, wait_reply)
+
+
+def _check_local_file(raw: str) -> Path:
+    s = config.get()
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"File not found on the server: {path}")
+    forbidden = (s.session.parent.resolve(), s.env_file)
+    if any(path == f or f in path.parents for f in forbidden):
+        raise ValueError("This file belongs to the server's credentials and is never sent.")
+    if not any(root == path or root in path.parents for root in s.allowed_roots):
+        roots = ", ".join(str(r) for r in s.allowed_roots)
+        raise ValueError(f"Only files inside {roots} can be sent (TG_ALLOWED_ROOTS).")
+    return path
+
+
+@tool("Send file", write=True)
+async def tg_send_file(
+    chat: str,
+    path: str | None = None,
+    url: str | None = None,
+    content_base64: str | None = None,
+    filename: str | None = None,
+    caption: str = "",
+    send_as: Literal["auto", "photo", "document", "voice", "video_note"] = "auto",
+    reply_to: int | None = None,
+    silent: bool = False,
+    wait_reply: float = 0,
+) -> str:
+    """Send a photo, voice message, video or any file. Give exactly one source:
+
+    path: a file on the server (from tg_get_media or inside TG_ALLOWED_ROOTS);
+    url: a public http(s) link that Telegram downloads itself;
+    content_base64 + filename: the file bytes, for clients that are not on the server.
+    send_as: auto picks by type, document keeps the original file, voice needs .ogg (opus) audio.
+    caption supports the same markdown as tg_send_message.
+    """
+    if sum(x is not None for x in (path, url, content_base64)) != 1:
+        raise ValueError("Pass exactly one of path, url or content_base64.")
+    s = config.get()
+    if path:
+        source = str(_check_local_file(path))
+    elif url:
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("url must start with http:// or https://")
+        source = url
+    else:
+        if not filename:
+            raise ValueError("filename is required with content_base64, e.g. report.pdf")
+        try:
+            data = base64.b64decode(content_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("content_base64 is not valid base64.") from None
+        outbox = s.files_dir / "outbox" / str(time.time_ns())  # own folder keeps the original file name
+        outbox.mkdir(parents=True)
+        target = outbox / safe_filename(filename)
+        target.write_bytes(data)
+        source = str(target)
+
+    client = await get_client()
+    entity = await resolve(chat)
+
+    def action():
+        return client.send_file(
+            entity, source, caption=caption or None, parse_mode="md", reply_to=reply_to, silent=silent,
+            force_document=send_as == "document", voice_note=send_as == "voice", video_note=send_as == "video_note",
+        )
+
+    sent, changed = await _act_and_wait(client, entity, action, wait_reply)
+    sent = sent[0] if isinstance(sent, list) else sent
+    return f"Sent #{sent.id} [{media_label(sent) or 'file'}] to {describe_chat(entity)}." + _replies(changed, wait_reply)
+
+
+@tool("Press a button", write=True)
+async def tg_click(chat: str, message_id: int, row: int, col: int, wait: float = 8.0) -> str:
+    """Press an inline or keyboard button on a message (usually a bot's) and return what changed.
+
+    row and col come from the "[row,col]" list under the message. Link and mini app buttons are not
+    opened, their URL is returned instead.
+    """
+    client = await get_client()
+    entity = await resolve(chat)
+    msg = await client.get_messages(entity, ids=message_id)
+    if msg is None:
+        return f"Message #{message_id} not found in this chat."
+    rows = button_rows(msg)
+    if not rows:
+        return f"Message #{message_id} has no buttons."
+    try:
+        button = rows[row][col]
+    except IndexError:
+        return f"Message #{message_id} has no button [{row},{col}]."
+
+    t = button.type
+    if isinstance(t, types.InlineButtonTypeCallback):
+        if t.requires_password:
+            return "This button asks for the account's 2FA password. Not pressing it."
+
+        async def action():
+            try:
+                return await client(
+                    functions.messages.GetBotCallbackAnswerRequest(peer=entity, msg_id=msg.id, data=t.data)
+                )
+            except errors.BotResponseTimeoutError:
+                return None
+
+    elif isinstance(t, types.ButtonTypeDefault):
+        def action():
+            return client.send_message(entity, button.text, parse_mode=None)
+
+    elif isinstance(t, (types.InlineButtonTypeUrl, types.InlineButtonTypeWebView, types.ButtonTypeSimpleWebView)):
+        return f"Button [{row},{col}] is a link, not opened: {t.url}"
+    else:
+        return (
+            f"Button [{row},{col}] is {type(t).__name__}. Buttons like this share your phone or location, "
+            "pay, or need inline mode, so they are not pressed."
+        )
+
+    answer, changed = await _act_and_wait(client, entity, action, max(wait, 1.0))
+    note = ""
+    if isinstance(answer, types.messages.BotCallbackAnswer) and (answer.message or answer.url):
+        note = f"Bot answered the click ({'alert' if answer.alert else 'toast'}): {answer.message or ''}"
+        if answer.url:
+            note += f" url: {answer.url}"
+    return (note or "Pressed.") + _replies(changed, max(wait, 1.0))
+
+
 # ---------------------------------------------------------------- transports
 
 
