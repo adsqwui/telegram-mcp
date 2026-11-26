@@ -132,6 +132,12 @@ def _headless() -> bool:
     return sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
+def _login_host() -> str:
+    """The QR page listens on loopback only: whoever opens it first can scan the code and get the
+    account. On a server, reach it through an SSH tunnel. TG_LOGIN_HOST overrides this."""
+    return (os.environ.get("TG_LOGIN_HOST") or "").strip() or "127.0.0.1"
+
+
 def _primary_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -206,21 +212,24 @@ async def qr_login(s: config.Settings, force: bool) -> None:
             await client.connect()
 
         headless = _headless()
-        host = os.environ.get("TG_LOGIN_HOST") or ("0.0.0.0" if headless else "127.0.0.1")
+        host = _login_host()
         try:
             page = QrPage(host, int(os.environ.get("TG_LOGIN_PORT") or 8766))
         except OSError:  # port busy: take any free one
             page = QrPage(host, 0)
-        shown = _primary_ip() if host == "0.0.0.0" else "127.0.0.1"
+        loopback = host in config.LOOPBACK_HOSTS
+        shown = _primary_ip() if host == "0.0.0.0" else host
         link = f"http://{shown}:{page.port}/{page.token}/"
 
         print("\nОткройте страницу с QR-кодом:")
         print(f"  {link}")
-        if headless:
-            print("Если порт закрыт файрволом, сделайте туннель со своего компьютера:")
-            print(f"  ssh -L {page.port}:127.0.0.1:{page.port} user@{shown}")
-            print(f"  и откройте http://127.0.0.1:{page.port}/{page.token}/")
-        else:
+        if not loopback:
+            print(f"Внимание: страница доступна всем, кто может достучаться до {host}:{page.port} (TG_LOGIN_HOST).")
+        if headless and loopback:
+            print("Страница слушает только этот сервер. Откройте её через SSH-туннель со своего компьютера:")
+            print(f"  ssh -L {page.port}:127.0.0.1:{page.port} user@{_primary_ip()}")
+            print("  и затем ссылку выше в браузере.")
+        elif not headless:
             webbrowser.open(link)
         print("Или сканируйте код прямо из терминала: Telegram → Настройки → Устройства → Подключить устройство.\n")
 
