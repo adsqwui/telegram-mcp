@@ -21,6 +21,8 @@ class Settings:
     api_id: int
     api_hash: str
     session: Path
+    connection: str
+    proxy: str | None
     tz: ZoneInfo
     read_only: bool
     allowed_chats: frozenset[str]
@@ -93,6 +95,8 @@ def load(env_file: str | Path | None = None) -> Settings:
         api_id=int(e("TG_API_ID") or 0),
         api_hash=e("TG_API_HASH", ""),
         session=_path(root, e("TG_SESSION"), "sessions/mcp"),
+        connection=(e("TG_CONNECTION") or "tcp").strip().lower(),
+        proxy=(e("TG_PROXY") or "").strip() or None,
         tz=ZoneInfo(e("TG_TIMEZONE") or "Europe/Moscow"),
         read_only=_bool(e("TG_READ_ONLY"), False),
         allowed_chats=_chat_list(e("TG_ALLOWED_CHATS")),

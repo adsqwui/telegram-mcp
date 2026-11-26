@@ -9,7 +9,7 @@ import time
 
 from telethon import TelegramClient, errors, functions, types, utils
 
-from . import __version__, config
+from . import __version__, config, network
 
 DEVICE_MODEL = "Telegram MCP"
 DIALOGS_TTL = 120.0
@@ -23,13 +23,28 @@ _dialogs: list = []
 _dialogs_at = 0.0
 
 
+class _Client(TelegramClient):
+    _long_poll: asyncio.Task | None = None
+
+    async def connect(self):
+        if self._connection is network.ConnectionHttp and (self._long_poll is None or self._long_poll.done()):
+            self._long_poll = asyncio.ensure_future(network.http_long_poll(self))
+        try:
+            await super().connect()
+        except BaseException:
+            if self._long_poll:
+                self._long_poll.cancel()
+            raise
+
+
 def make_client(settings: config.Settings) -> TelegramClient:
     """Same device info for login and server, so the session shows up as "Telegram MCP"."""
     settings.session.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return TelegramClient(
+    return _Client(
         str(settings.session),
         settings.api_id,
         settings.api_hash,
+        **network.client_options(settings.connection, settings.proxy),
         device_model=DEVICE_MODEL,
         system_version=f"{platform.system()} {platform.release()}",
         app_version=__version__,

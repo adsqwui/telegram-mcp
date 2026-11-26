@@ -208,3 +208,16 @@ def test_http_long_poll_sends_http_wait_when_idle():
 
     asyncio.run(run())
 
+
+def test_settings_reach_the_client(tmp_path, monkeypatch):
+    from telegram_mcp import client, config
+
+    monkeypatch.setenv("TG_CONNECTION", "WebSocket")
+    monkeypatch.setenv("TG_PROXY", "socks5://u:p@127.0.0.1:1080")
+    monkeypatch.setenv("TG_SESSION", str(tmp_path / "s"))
+    env = tmp_path / ".env"
+    env.write_text("TG_API_ID=1\nTG_API_HASH=x\n")
+    c = client.make_client(config.load(env))
+    assert c._connection is network.ConnectionWebSocket
+    assert c._proxy["addr"] == "127.0.0.1" and c._proxy["username"] == "u"
+    c.session.close()

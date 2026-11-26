@@ -288,6 +288,27 @@ Messages with media: 4521. tg_get_media returns images, transcripts and file con
 
 После смены `TG_WHISPER_MODEL` выполните `uv run telegram-mcp-model`.
 
+### Подключение и прокси
+
+Если Telegram у вас блокируют или режут, поменяйте способ подключения в `.env`. Настройка действует и на сервер, и на `telegram-mcp-login`.
+
+| `TG_CONNECTION` | Как ходит трафик |
+|---|---|
+| `tcp` | Обычный MTProto на порт 443 (по умолчанию) |
+| `obfuscated` | MTProto с обфускацией, по виду не отличить от случайных байтов |
+| `http` | MTProto поверх обычного HTTP на порт 80, для сетей, где наружу пускают только HTTP |
+| `websocket` | `wss://*.web.telegram.org`, как у веб-версии Telegram. Снаружи это обычный HTTPS к сайту telegram.org, поэтому проходит почти везде |
+
+`TG_PROXY` пускает любое из этих подключений через прокси:
+
+```bash
+TG_PROXY=socks5://user:pass@127.0.0.1:1080   # или socks4://, http:// (HTTP CONNECT)
+TG_PROXY=https://t.me/socks?server=1.2.3.4&port=1080&user=u&pass=p
+TG_PROXY=https://t.me/proxy?server=1.2.3.4&port=443&secret=dd...   # MTProxy
+```
+
+Логин и пароль с особыми символами (`@`, `:`, `%`) в URL записывайте через `%40`, `%3A`, `%25`. MTProxy работает только с `TG_CONNECTION=tcp`, а секреты fake-TLS (начинаются с `ee`) Telethon не поддерживает. Что сейчас используется, покажет `tg_status`, пароль и секрет он не выводит.
+
 ## Безопасность
 
 Сервер работает от имени настоящего аккаунта, поэтому несколько вещей устроены строже обычного:

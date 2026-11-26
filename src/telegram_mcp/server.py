@@ -17,7 +17,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 from telethon import errors, functions, types, utils
 
-from . import __version__, config, media
+from . import __version__, config, media, network
 from .client import describe_chat, dialogs, get_client, is_visible, kind_of, resolve
 from .render import (
     button_rows,
@@ -140,6 +140,7 @@ async def tg_status() -> str:
         f"account: {name}" + (f" @{me.username}" if me.username else "") + f" (id {me.id})",
         f"read only: {s.read_only}",
         "allowed chats: " + (", ".join(sorted(s.allowed_chats)) if s.allowed_chats else "all (TG_ALLOWED_CHATS is empty)"),
+        f"connection: {network.describe(s.connection, s.proxy)}",
         f"timezone: {s.tz.key}",
         f"transcription: {'on, whisper ' + s.whisper_model if s.transcribe else 'off'}",
         f"files are saved to: {s.files_dir}",
