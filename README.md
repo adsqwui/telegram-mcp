@@ -192,7 +192,7 @@ cd ~/telegram-mcp && ./install.sh
 - `search` и `from_user`: поиск по тексту и сообщения конкретного человека.
 - Голосовые и кружки приходят сразу с расшифровкой. Расшифровка кешируется, одно сообщение обрабатывается один раз.
 - `include_images=true` прикладывает фото как изображения, до 10 за вызов.
-- `mark_read=true` отмечает чат прочитанным. По умолчанию сервер ничего прочитанным не отмечает.
+- `mark_read=true` отмечает чат прочитанным. По умолчанию сервер ничего прочитанным не отмечает, а при `TG_READ_ONLY=true` такой вызов отклоняется.
 
 </details>
 
@@ -275,7 +275,7 @@ Messages with media: 4521. tg_get_media returns images, transcripts and file con
 | Переменная | По умолчанию | Что это |
 |---|---|---|
 | `TG_TIMEZONE` | `Europe/Moscow` | Пояс для `today` и времени в ответах |
-| `TG_READ_ONLY` | `false` | `true` запрещает отправку и создание чатов |
+| `TG_READ_ONLY` | `false` | `true` запрещает отправку, создание чатов и `mark_read` |
 | `TG_ALLOWED_CHATS` | пусто, все чаты | Белый список через запятую: id из `tg_list_chats`, `@username`, `t.me/username` или `me` |
 | `TG_WHISPER_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3`. Больше модель, точнее и медленнее |
 | `TG_WHISPER_LANGUAGE` | авто | Например `ru`, чтобы не тратить время на определение языка |

@@ -259,9 +259,11 @@ async def tg_read_messages(
     search: only messages containing this text. from_user: only messages from this person.
     transcribe_voice: voice and round video messages come with a text transcript.
     include_images: photos are attached as images (at most 10 per call).
-    mark_read: mark the chat as read up to the newest returned message.
+    mark_read: mark the chat as read up to the newest returned message (refused with TG_READ_ONLY=true).
     """
     s = config.get()
+    if mark_read and s.read_only:
+        raise ToolError("Refused: mark_read changes the account and the server runs with TG_READ_ONLY=true.")
     client = await get_client()
     entity = await resolve(chat)
     lo = hi = None

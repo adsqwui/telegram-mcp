@@ -117,3 +117,22 @@ def test_bearer_auth():
 
     asyncio.run(guarded({"type": "lifespan"}, receive, send))
     assert calls == ["http", "lifespan"]
+
+
+def test_mark_read_refused_in_read_only(tmp_path, monkeypatch):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from telegram_mcp import server
+
+    async def no_client():
+        raise AssertionError("must refuse before touching Telegram")
+
+    monkeypatch.setattr(server, "get_client", no_client)
+    monkeypatch.setenv("TG_READ_ONLY", "true")
+    env = tmp_path / ".env"
+    env.write_text("TG_API_ID=1\nTG_API_HASH=x\n")
+    config.load(env)
+    with pytest.raises(ToolError, match="TG_READ_ONLY"):
+        asyncio.run(server.tg_read_messages("me", mark_read=True))
+    with pytest.raises(AssertionError, match="before touching"):  # plain reading is still allowed
+        asyncio.run(server.tg_read_messages("me"))
