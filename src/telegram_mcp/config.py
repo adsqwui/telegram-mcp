@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ class Settings:
     session: Path
     tz: ZoneInfo
     read_only: bool
+    allowed_chats: frozenset[str]
     min_action_gap: float
     files_dir: Path
     allowed_roots: tuple[Path, ...]
@@ -43,6 +45,27 @@ def _bool(value: str | None, default: bool) -> bool:
     if value is None or value.strip() == "":
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_CHAT_USERNAME = re.compile(r"(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([A-Za-z]\w{3,31})/?", re.I)
+
+
+def _chat_list(value: str | None) -> frozenset[str]:
+    """TG_ALLOWED_CHATS: ids, @usernames, t.me/username links and "me", separated by commas or spaces.
+    Titles are not accepted: anyone can create a chat with the same title."""
+    chats = set()
+    for item in re.split(r"[,\s]+", value or ""):
+        if not item:
+            continue
+        if item.lower() == "me":
+            chats.add("me")
+        elif re.fullmatch(r"-?\d+", item):
+            chats.add(str(int(item)))
+        elif m := _CHAT_USERNAME.fullmatch(item):
+            chats.add("@" + m.group(1).lower())
+        else:
+            raise ValueError(f"TG_ALLOWED_CHATS: {item!r} is not a chat id, @username or 'me'.")
+    return frozenset(chats)
 
 
 def _path(root: Path, value: str | None, default: str) -> Path:
@@ -72,6 +95,7 @@ def load(env_file: str | Path | None = None) -> Settings:
         session=_path(root, e("TG_SESSION"), "sessions/mcp"),
         tz=ZoneInfo(e("TG_TIMEZONE") or "Europe/Moscow"),
         read_only=_bool(e("TG_READ_ONLY"), False),
+        allowed_chats=_chat_list(e("TG_ALLOWED_CHATS")),
         min_action_gap=float(e("TG_MIN_ACTION_GAP") or 1.0),
         files_dir=files_dir,
         allowed_roots=allowed,

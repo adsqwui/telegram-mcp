@@ -111,15 +111,38 @@ def is_hidden(entity) -> bool:
     return utils.get_peer_id(entity) in HIDDEN_CHATS
 
 
-async def resolve(ref: str):
-    """Entity for an id, @username, t.me link (public or invite), "me", or a chat title from the dialog list."""
-    entity = await _resolve(ref)
+def is_allowed(entity) -> bool:
+    """True when TG_ALLOWED_CHATS is empty or lists this chat by id, @username or "me"."""
+    allowed = config.get().allowed_chats
+    if not allowed:
+        return True
+    if getattr(entity, "is_self", False) and "me" in allowed:
+        return True
+    if str(utils.get_peer_id(entity)) in allowed:
+        return True
+    names = [getattr(entity, "username", None), *(u.username for u in getattr(entity, "usernames", None) or [])]
+    return any(n and f"@{n.lower()}" in allowed for n in names)
+
+
+def is_visible(entity) -> bool:
+    return not is_hidden(entity) and is_allowed(entity)
+
+
+async def resolve(ref: str, *, allowed_only: bool = True):
+    """Entity for an id, @username, t.me link (public or invite), "me", or a chat title from the dialog list.
+
+    allowed_only=False skips TG_ALLOWED_CHATS, for refs that name a person inside an allowed chat
+    (a sender filter, members to add) rather than a chat to open.
+    """
+    entity = await _resolve(ref, is_visible if allowed_only else (lambda e: not is_hidden(e)))
     if is_hidden(entity):
         raise ValueError("The Telegram service chat (login codes) is not available through this server.")
+    if allowed_only and not is_allowed(entity):
+        raise ValueError("This chat is not in TG_ALLOWED_CHATS.")
     return entity
 
 
-async def _resolve(ref: str):
+async def _resolve(ref: str, keep):
     client = await get_client()
     kind, value = parse_chat_ref(ref)
     if kind == "me":
@@ -139,7 +162,7 @@ async def _resolve(ref: str):
         return await client.get_entity(value)
 
     needle = str(value).casefold()
-    visible = [d for d in await dialogs() if not is_hidden(d.entity)]
+    visible = [d for d in await dialogs() if keep(d.entity)]
     found = [d.entity for d in visible if (d.name or "").casefold() == needle]
     if not found:
         found = [d.entity for d in visible if needle in (d.name or "").casefold()]

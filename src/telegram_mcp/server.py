@@ -18,7 +18,7 @@ from mcp_types import ToolAnnotations
 from telethon import errors, functions, types, utils
 
 from . import __version__, config, media
-from .client import describe_chat, dialogs, get_client, is_hidden, kind_of, resolve
+from .client import describe_chat, dialogs, get_client, is_visible, kind_of, resolve
 from .render import (
     button_rows,
     day_range,
@@ -139,6 +139,7 @@ async def tg_status() -> str:
     lines = [
         f"account: {name}" + (f" @{me.username}" if me.username else "") + f" (id {me.id})",
         f"read only: {s.read_only}",
+        "allowed chats: " + (", ".join(sorted(s.allowed_chats)) if s.allowed_chats else "all (TG_ALLOWED_CHATS is empty)"),
         f"timezone: {s.tz.key}",
         f"transcription: {'on, whisper ' + s.whisper_model if s.transcribe else 'off'}",
         f"files are saved to: {s.files_dir}",
@@ -163,7 +164,7 @@ async def tg_list_chats(
     needle = (query or "").strip().lstrip("@").casefold()
     rows, total = [], 0
     for d in await dialogs(force=True):
-        if is_hidden(d.entity):
+        if not is_visible(d.entity):
             continue
         k = kind_of(d.entity)
         if kind != "all" and k != kind and not (kind == "private" and k == "saved"):
@@ -271,7 +272,7 @@ async def tg_read_messages(
     if until:
         hi = parse_moment(until, s.tz, end_of_day=True)
     limit = max(1, min(limit, MAX_READ))
-    sender = await resolve(from_user) if from_user else None
+    sender = await resolve(from_user, allowed_only=False) if from_user else None
 
     msgs, more = [], False
     async for m in client.iter_messages(
@@ -513,7 +514,7 @@ async def _invite(client, entity, members: list[str]) -> list[str]:
     report = []
     for ref in members:
         try:
-            user = await resolve(ref)
+            user = await resolve(ref, allowed_only=False)
             if not isinstance(user, types.User):
                 report.append(f"  {ref}: not a user, skipped")
                 continue

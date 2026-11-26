@@ -276,6 +276,7 @@ Messages with media: 4521. tg_get_media returns images, transcripts and file con
 |---|---|---|
 | `TG_TIMEZONE` | `Europe/Moscow` | Пояс для `today` и времени в ответах |
 | `TG_READ_ONLY` | `false` | `true` запрещает отправку и создание чатов |
+| `TG_ALLOWED_CHATS` | пусто, все чаты | Белый список через запятую: id из `tg_list_chats`, `@username`, `t.me/username` или `me` |
 | `TG_WHISPER_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3`. Больше модель, точнее и медленнее |
 | `TG_WHISPER_LANGUAGE` | авто | Например `ru`, чтобы не тратить время на определение языка |
 | `TG_TRANSCRIBE_MAX_SECONDS` | `600` | Более длинные голосовые расшифровываются только через `tg_get_media` |
@@ -296,6 +297,7 @@ Messages with media: 4521. tg_get_media returns images, transcripts and file con
 - **Отправка с диска ограничена** папками из `TG_ALLOWED_ROOTS`.
 - **HTTP закрыт токеном**, сравнение идёт за постоянное время. Без токена сервер слушает только loopback.
 - **Режим только чтения** (`TG_READ_ONLY=true`) удобен, пока вы проверяете нового агента.
+- **Белый список чатов** (`TG_ALLOWED_CHATS`). Если он задан, остальные чаты не видны в `tg_list_chats`, а открыть их по id, ссылке или названию нельзя. Названия в списке не принимаются: чат с таким же названием может создать кто угодно. Отправителя в `from_user` и людей для `tg_add_members` в список добавлять не нужно, проверяется сам чат. Созданные агентом группы и каналы в список не попадают сами, их id нужно дописать.
 
 Что сделать вам:
 
